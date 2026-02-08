@@ -254,7 +254,7 @@ func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, er
 
 	var netConn net.Conn
 	switch u.Scheme {
-	case "ircs":
+	case "ircs", "ircs+insecure":
 		addr := u.Host
 		host, _, err := net.SplitHostPort(u.Host)
 		if err != nil {
@@ -263,6 +263,9 @@ func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, er
 		}
 
 		tlsConfig := &tls.Config{ServerName: host, NextProtos: []string{"irc"}}
+		if u.Scheme == "ircs+insecure" {
+			tlsConfig.InsecureSkipVerify = true
+		}
 		if network.SASL.Mechanism == "EXTERNAL" {
 			if network.SASL.External.CertBlob == nil {
 				return nil, fmt.Errorf("missing certificate for authentication")

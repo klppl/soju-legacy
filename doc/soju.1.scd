@@ -289,6 +289,7 @@ character.
 	_addr_ supports several connection types:
 
 	- _[ircs://]<host>[:port]_ connects with TLS over TCP
+	- _ircs+insecure://<host>[:port]_ connects with TLS over TCP (without certificate verification)
 	- _irc+insecure://<host>[:port]_ connects with plain-text TCP
 	- _irc+unix:///<path>_ connects to a Unix socket
 

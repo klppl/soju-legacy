@@ -1064,7 +1064,7 @@ func (u *user) checkNetwork(record *database.Network) error {
 		return fmt.Errorf("%v:// URL must not have a fragment", url.Scheme)
 	}
 	switch url.Scheme {
-	case "ircs", "irc+insecure":
+	case "ircs", "ircs+insecure", "irc+insecure":
 		if url.Host == "" {
 			return fmt.Errorf("%v:// URL must have a host", url.Scheme)
 		}
