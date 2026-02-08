@@ -1,9 +1,31 @@
 # [soju]
 
+![Build Status](https://github.com/klppl/soju-legacy/actions/workflows/docker-publish.yml/badge.svg)
+
 soju is a user-friendly IRC bouncer. soju connects to upstream IRC servers on
 behalf of the user to provide extra functionality. soju supports many features
 such as multiple users, numerous [IRCv3] extensions, chat history playback and
 detached channels. It is well-suited for both small and large deployments.
+
+## Why this fork?
+
+Standard soju is strictly secure by design. However, some legacy IRC networks use self-signed certificates or outdated TLS stacks that cause handshake failures.
+
+This version adds:
+- `ircs+insecure://` scheme support for network create/update to bypass certificate verification.
+
+## Docker Usage
+
+You can run this fork using Docker:
+
+```bash
+docker run -d \
+  --name soju \
+  -v /var/lib/soju:/var/lib/soju \
+  -p 6697:6697 \
+  ghcr.io/klppl/soju-legacy:master
+```
+
 
 ## Usage
 

@@ -43,4 +43,6 @@ WORKDIR /var/lib/soju
 # Expose the default listener port
 EXPOSE 6697
 
+LABEL org.opencontainers.image.source=https://github.com/klppl/soju-legacy
+
 ENTRYPOINT ["/usr/bin/soju"]
