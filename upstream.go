@@ -265,6 +265,20 @@ func connectToUpstream(ctx context.Context, network *network) (*upstreamConn, er
 		tlsConfig := &tls.Config{ServerName: host, NextProtos: []string{"irc"}}
 		if u.Scheme == "ircs+insecure" {
 			tlsConfig.InsecureSkipVerify = true
+			// Don't use ALPN on insecure connections, because some servers might
+			// be old and fail the handshake.
+			tlsConfig.NextProtos = nil
+			// Allow older TLS versions
+			tlsConfig.MinVersion = tls.VersionTLS10
+			// Allow older ciphers
+			var ciphers []uint16
+			for _, c := range tls.CipherSuites() {
+				ciphers = append(ciphers, c.ID)
+			}
+			for _, c := range tls.InsecureCipherSuites() {
+				ciphers = append(ciphers, c.ID)
+			}
+			tlsConfig.CipherSuites = ciphers
 		}
 		if network.SASL.Mechanism == "EXTERNAL" {
 			if network.SASL.External.CertBlob == nil {
