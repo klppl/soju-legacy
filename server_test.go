@@ -10,6 +10,7 @@ import (
 
 	"gopkg.in/irc.v4"
 
+	"codeberg.org/emersion/soju/config"
 	"codeberg.org/emersion/soju/database"
 	"codeberg.org/emersion/soju/xirc"
 )
@@ -69,7 +70,7 @@ func createTestUser(t *testing.T, db database.Database) *database.User {
 
 func createTestDownstream(t *testing.T, srv *Server) ircConn {
 	c1, c2 := net.Pipe()
-	go srv.Handle(newNetIRCConn(c1))
+	go srv.serveConn(newNetIRCConn(c1))
 	return newNetIRCConn(c2)
 }
 
@@ -258,8 +259,7 @@ func testChatHistory(t *testing.T, msgStoreDriver, msgStorePath string) {
 	srv.Logger = newDebugLogger(t)
 
 	cfg := *srv.Config()
-	cfg.MsgStoreDriver = msgStoreDriver
-	cfg.MsgStorePath = msgStorePath
+	cfg.MsgStore = config.MsgStore{Driver: msgStoreDriver, Source: msgStorePath}
 	srv.SetConfig(&cfg)
 
 	if err := srv.Start(); err != nil {

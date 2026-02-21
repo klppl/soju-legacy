@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -149,23 +148,13 @@ func (ln *retryListener) Accept() (net.Conn, error) {
 }
 
 type Config struct {
-	Hostname                  string
-	Title                     string
-	IconPath                  string
-	IconURL                   string
-	MsgStoreDriver            string
-	MsgStorePath              string
-	HTTPOrigins               []string
-	HTTPIngress               string
-	AcceptProxyIPs            config.IPSet
-	AcceptProxyUnix           bool
-	MaxUserNetworks           int
-	MOTD                      string
-	UpstreamUserIPs           []*net.IPNet
-	DisableInactiveUsersDelay time.Duration
-	EnableUsersOnAuth         bool
-	Auth                      *auth.Authenticator
-	FileUploader              fileupload.Uploader
+	config.BasicServer
+
+	IconPath     string
+	IconURL      string
+	MOTD         string
+	Auth         *auth.Authenticator
+	FileUploader fileupload.Uploader
 }
 
 type Server struct {
@@ -208,9 +197,11 @@ func NewServer(db database.Database) *Server {
 		stopCh:    make(chan struct{}),
 	}
 	srv.config.Store(&Config{
-		Hostname:        "localhost",
-		MaxUserNetworks: -1,
-		Auth:            auth.NewInternal(),
+		BasicServer: config.BasicServer{
+			Hostname:        "localhost",
+			MaxUserNetworks: -1,
+		},
+		Auth: auth.NewInternal(),
 	})
 	return srv
 }
@@ -466,7 +457,7 @@ func (s *Server) addUserLocked(user *database.User) *user {
 
 var lastDownstreamID uint64
 
-func (s *Server) Handle(ic ircConn) {
+func (s *Server) serveConn(ic ircConn) {
 	defer func() {
 		if err := recover(); err != nil {
 			s.Logger.Printf("panic serving downstream %q: %v\n%v", ic.RemoteAddr(), err, string(debug.Stack()))
@@ -539,7 +530,7 @@ func (s *Server) getOrCreateUser(ctx context.Context, username string) (*user, e
 	return user, nil
 }
 
-func (s *Server) HandleAdmin(ic ircConn) {
+func (s *Server) serveConnAdmin(ic ircConn) {
 	defer func() {
 		if err := recover(); err != nil {
 			s.Logger.Printf("panic serving admin client %q: %v\n%v", ic.RemoteAddr(), err, string(debug.Stack()))
@@ -632,7 +623,7 @@ func (s *Server) HandleAdmin(ic ircConn) {
 	}
 }
 
-func (s *Server) Serve(ln net.Listener, handler func(ircConn)) error {
+func (s *Server) serve(ln net.Listener, serveConn func(ircConn)) error {
 	ln = &retryListener{
 		Listener: ln,
 		Logger:   &prefixLogger{logger: s.Logger, prefix: fmt.Sprintf("listener %v: ", ln.Addr())},
@@ -660,8 +651,16 @@ func (s *Server) Serve(ln net.Listener, handler func(ircConn)) error {
 			return fmt.Errorf("failed to accept connection: %v", err)
 		}
 
-		go handler(newNetIRCConn(conn))
+		go serveConn(newNetIRCConn(conn))
 	}
+}
+
+func (s *Server) Serve(ln net.Listener) error {
+	return s.serve(ln, s.serveConn)
+}
+
+func (s *Server) ServeAdmin(ln net.Listener) error {
+	return s.serve(ln, s.serveConnAdmin)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -674,38 +673,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	isProxy := false
+	// TODO: accept proxy depending on AcceptProxyUnix
+	acceptProxy := false
 	if host, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
 		if ip := net.ParseIP(host); ip != nil {
-			isProxy = s.Config().AcceptProxyIPs.Contains(ip)
+			acceptProxy = s.Config().AcceptProxyIPs.Contains(ip)
 		}
 	}
 
-	// Only trust the Forwarded header field if this is a trusted proxy IP
-	// to prevent users from spoofing the remote address
-	remoteAddr := req.RemoteAddr
-	if isProxy {
-		forwarded := parseForwarded(req.Header)
-		if forwarded["for"] != "" {
-			remoteAddr = forwarded["for"]
-		}
-	}
-
-	s.Handle(newWebsocketIRCConn(conn, remoteAddr))
-}
-
-func parseForwarded(h http.Header) map[string]string {
-	forwarded := h.Get("Forwarded")
-	if forwarded == "" {
-		return map[string]string{
-			"for":   h.Get("X-Forwarded-For"),
-			"proto": h.Get("X-Forwarded-Proto"),
-			"host":  h.Get("X-Forwarded-Host"),
-		}
-	}
-	// Hack to easily parse header parameters
-	_, params, _ := mime.ParseMediaType("hack; " + forwarded)
-	return params
+	s.serveConn(newWebsocketIRCConn(conn, req, acceptProxy))
 }
 
 type ServerStats struct {

@@ -137,23 +137,12 @@ func loadConfig() (*config.Server, *soju.Config, error) {
 	}
 
 	cfg := &soju.Config{
-		Hostname:                  raw.Hostname,
-		Title:                     raw.Title,
-		IconURL:                   iconURL,
-		IconPath:                  iconPath,
-		MsgStoreDriver:            raw.MsgStore.Driver,
-		MsgStorePath:              raw.MsgStore.Source,
-		HTTPOrigins:               raw.HTTPOrigins,
-		HTTPIngress:               raw.HTTPIngress,
-		AcceptProxyIPs:            raw.AcceptProxyIPs,
-		AcceptProxyUnix:           raw.AcceptProxyUnix,
-		MaxUserNetworks:           raw.MaxUserNetworks,
-		UpstreamUserIPs:           raw.UpstreamUserIPs,
-		DisableInactiveUsersDelay: raw.DisableInactiveUsersDelay,
-		EnableUsersOnAuth:         raw.EnableUsersOnAuth,
-		MOTD:                      motd,
-		Auth:                      &authenticator,
-		FileUploader:              fileUploader,
+		BasicServer:  raw.BasicServer,
+		IconURL:      iconURL,
+		IconPath:     iconPath,
+		MOTD:         motd,
+		Auth:         &authenticator,
+		FileUploader: fileUploader,
 	}
 	return raw, cfg, nil
 }
@@ -412,7 +401,7 @@ func listenAndServeIRC(srv *soju.Server, label, network, addr string, tlsConfig 
 	ln = proxyProtoListener(ln, srv)
 
 	go func() {
-		if err := srv.Serve(ln, srv.Handle); err != nil {
+		if err := srv.Serve(ln); err != nil {
 			log.Printf("serving %q: %v", label, err)
 		}
 	}()
@@ -427,7 +416,7 @@ func listenAndServeAdmin(srv *soju.Server, label, path string) {
 	ln = proxyProtoListener(ln, srv)
 
 	go func() {
-		if err := srv.Serve(ln, srv.HandleAdmin); err != nil {
+		if err := srv.ServeAdmin(ln); err != nil {
 			log.Printf("serving %q: %v", label, err)
 		}
 	}()

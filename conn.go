@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"errors"
 	"io"
+	"mime"
 	"net"
+	"net/http"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -42,7 +45,9 @@ type netIRCConn struct {
 func (nc netIRCConn) GetPeerCertificate() *x509.Certificate {
 	var c net.Conn = nc.netConn
 	if pc, ok := c.(*proxyproto.Conn); ok {
-		if cert, _ := certFromProxyprotoConn(pc); cert != nil {
+		header := pc.ProxyHeader()
+		if header != nil {
+			cert, _ := certFromProxyprotoHeader(header)
 			return cert
 		}
 		c = pc.Raw()
@@ -62,12 +67,7 @@ func newNetIRCConn(c net.Conn) ircConn {
 	return netIRCConn{irc.NewConn(c), c}
 }
 
-func certFromProxyprotoConn(c *proxyproto.Conn) (*x509.Certificate, error) {
-	header := c.ProxyHeader()
-	if header == nil {
-		return nil, nil
-	}
-
+func certFromProxyprotoHeader(header *proxyproto.Header) (*x509.Certificate, error) {
 	tlvs, err := header.TLVs()
 	if err != nil {
 		return nil, err
@@ -87,13 +87,15 @@ func certFromProxyprotoConn(c *proxyproto.Conn) (*x509.Certificate, error) {
 }
 
 type websocketIRCConn struct {
-	conn                        *websocket.Conn
+	conn        *websocket.Conn
+	req         *http.Request
+	acceptProxy bool
+
 	readDeadline, writeDeadline time.Time
-	remoteAddr                  string
 }
 
-func newWebsocketIRCConn(c *websocket.Conn, remoteAddr string) ircConn {
-	return &websocketIRCConn{conn: c, remoteAddr: remoteAddr}
+func newWebsocketIRCConn(c *websocket.Conn, req *http.Request, acceptProxy bool) ircConn {
+	return &websocketIRCConn{conn: c, req: req, acceptProxy: acceptProxy}
 }
 
 func (wic *websocketIRCConn) ReadMessage() (*irc.Message, error) {
@@ -141,7 +143,30 @@ func (wic *websocketIRCConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (wic *websocketIRCConn) RemoteAddr() net.Addr {
-	return websocketAddr(wic.remoteAddr)
+	// Only trust the Forwarded header field if this is a trusted proxy IP
+	// to prevent users from spoofing the remote address
+	remoteAddr := wic.req.RemoteAddr
+	if wic.acceptProxy {
+		forwarded := parseForwarded(wic.req.Header)
+		if forwarded["for"] != "" {
+			remoteAddr = forwarded["for"]
+		}
+	}
+	return websocketAddr(remoteAddr)
+}
+
+func parseForwarded(h http.Header) map[string]string {
+	forwarded := h.Get("Forwarded")
+	if forwarded == "" {
+		return map[string]string{
+			"for":   h.Get("X-Forwarded-For"),
+			"proto": h.Get("X-Forwarded-Proto"),
+			"host":  h.Get("X-Forwarded-Host"),
+		}
+	}
+	// Hack to easily parse header parameters
+	_, params, _ := mime.ParseMediaType("hack; " + forwarded)
+	return params
 }
 
 func (wic *websocketIRCConn) LocalAddr() net.Addr {
@@ -151,7 +176,32 @@ func (wic *websocketIRCConn) LocalAddr() net.Addr {
 }
 
 func (wic *websocketIRCConn) GetPeerCertificate() *x509.Certificate {
-	return nil
+	clientCert := wic.req.Header.Get("Client-Cert")
+	if clientCert != "" && wic.acceptProxy {
+		cert, _ := parseClientCert(clientCert)
+		return cert
+	}
+
+	certs := wic.req.TLS.PeerCertificates
+	if len(certs) == 0 {
+		return nil
+	}
+	return certs[0]
+}
+
+func parseClientCert(s string) (*x509.Certificate, error) {
+	s, prefixOK := strings.CutPrefix(s, ":")
+	s, suffixOK := strings.CutSuffix(s, ":")
+	if !prefixOK || !suffixOK {
+		return nil, errors.New("missing ':' delimiters around byte sequence")
+	}
+
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+
+	return x509.ParseCertificate(b)
 }
 
 type websocketAddr string
