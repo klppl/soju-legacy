@@ -1048,7 +1048,6 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			return err
 		}
 
-		var downstreamIsupport []string
 		for _, token := range msg.Params[1 : len(msg.Params)-1] {
 			parameter, negate := strings.CutPrefix(token, "-")
 			var (
@@ -1112,19 +1111,12 @@ func (uc *upstreamConn) handleMessage(ctx context.Context, msg *irc.Message) err
 			if err != nil {
 				return err
 			}
-
-			if passthroughIsupport[parameter] {
-				downstreamIsupport = append(downstreamIsupport, token)
-			}
 		}
 
 		uc.updateMonitor(ctx)
 
 		uc.forEachDownstream(func(dc *downstreamConn) {
-			msgs := xirc.GenerateIsupport(downstreamIsupport)
-			for _, msg := range msgs {
-				dc.SendMessage(ctx, msg)
-			}
+			dc.updateIsupport(ctx)
 		})
 	case irc.ERR_NOMOTD, irc.RPL_ENDOFMOTD:
 		if !uc.gotMotd {

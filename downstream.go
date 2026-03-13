@@ -224,6 +224,10 @@ func downstreamLabelContextFrom(ctx context.Context, downstreamID uint64) *downs
 	}
 }
 
+func newString(s string) *string {
+	return &s
+}
+
 // illegalNickChars is the list of characters forbidden in a nickname.
 //
 //   - ' ' and ':' break the IRC message wire format
@@ -256,6 +260,7 @@ var permanentDownstreamCaps = map[string]string{
 	"draft/pre-away":          "",
 	"draft/read-marker":       "",
 	"draft/no-implicit-names": "",
+	"draft/extended-isupport": "",
 
 	"soju.im/account-required":        "",
 	"soju.im/bouncer-networks":        "",
@@ -284,8 +289,8 @@ var passthroughDownstreamCaps = map[string]string{
 
 // permanentIsupport is the set of ISUPPORT tokens that are always passed
 // to downstream clients.
-var permanentIsupport = []string{
-	"soju.im/SAFERATE",
+var permanentIsupport = map[string]*string{
+	"soju.im/SAFERATE": nil,
 }
 
 // passthroughIsupport is the set of ISUPPORT tokens that are directly passed
@@ -384,6 +389,7 @@ type downstreamConn struct {
 
 	capVersion   int
 	caps         xirc.CapRegistry
+	isupport     map[string]*string
 	sasl         *downstreamSASL         // nil unless SASL is underway
 	registration *downstreamRegistration // nil after RPL_WELCOME
 
@@ -395,6 +401,7 @@ type downstreamConn struct {
 }
 
 func newDownstreamConn(srv *Server, ic ircConn, id uint64) *downstreamConn {
+	srvConfig := srv.Config()
 	remoteAddr := ic.RemoteAddr().String()
 	logger := &prefixLogger{srv.Logger, fmt.Sprintf("downstream %q: ", remoteAddr)}
 	options := connOptions{Logger: logger}
@@ -406,6 +413,7 @@ func newDownstreamConn(srv *Server, ic ircConn, id uint64) *downstreamConn {
 		nickCM:       "*",
 		username:     "~u",
 		caps:         xirc.NewCapRegistry(),
+		isupport:     make(map[string]*string),
 		casemap:      cm,
 		monitored:    xirc.NewCaseMappingMap[struct{}](cm),
 		metadataSubs: map[string]bool{},
@@ -420,17 +428,20 @@ func newDownstreamConn(srv *Server, ic ircConn, id uint64) *downstreamConn {
 		dc.caps.Available[k] = v
 	}
 	saslMechanisms := serverSASLMechanisms(dc.srv)
-	if ic.GetPeerCertificate() != nil {
+	if srvConfig.ClientCertAuth && ic.GetPeerCertificate() != nil {
 		saslMechanisms = append(saslMechanisms, "EXTERNAL")
 	}
 	dc.caps.Available["sasl"] = strings.Join(saslMechanisms, ",")
 	// TODO: this is racy, we should only enable chathistory after
 	// authentication and then check that user.msgStore implements
 	// chatHistoryMessageStore
-	switch srv.Config().MsgStore.Driver {
+	switch srvConfig.MsgStore.Driver {
 	case "fs", "db":
 		dc.caps.Available["draft/chathistory"] = ""
 		dc.caps.Available["soju.im/search"] = ""
+	}
+	if srvConfig.ClientCertAuth {
+		dc.caps.Available["soju.im/client-cert"] = ""
 	}
 	return dc
 }
@@ -731,6 +742,13 @@ func (dc *downstreamConn) handleMessage(ctx context.Context, msg *irc.Message) e
 	case "QUIT":
 		dc.conn.Shutdown(ctx)
 		// TODO: stop handling commands
+	case "ISUPPORT":
+		if !dc.caps.IsEnabled("draft/extended-isupport") {
+			return newUnknownCommandError(msg.Command)
+		}
+		isupport := dc.buildIsupport()
+		sendIsupport(ctx, dc, isupport)
+		dc.isupport = isupport
 	default:
 		var err error
 		if dc.registered {
@@ -828,6 +846,10 @@ func (dc *downstreamConn) handleMessageUnregistered(ctx context.Context, msg *ir
 				break
 			}
 		case "EXTERNAL":
+			if !dc.srv.Config().ClientCertAuth {
+				err = fmt.Errorf("SASL EXTERNAL not supported")
+				break
+			}
 			cert := dc.conn.conn.GetPeerCertificate()
 			if cert == nil {
 				err = fmt.Errorf("TLS client certificate not sent")
@@ -1282,6 +1304,93 @@ func (dc *downstreamConn) updateSupportedCaps(ctx context.Context) {
 	}
 }
 
+func (dc *downstreamConn) buildIsupport() map[string]*string {
+	srvConfig := dc.srv.Config()
+	isupport := make(map[string]*string)
+	for k, v := range permanentIsupport {
+		isupport[k] = v
+	}
+	if dc.network != nil {
+		isupport["BOUNCER_NETID"] = newString(fmt.Sprintf("%v", dc.network.ID))
+	}
+	if dc.network == nil && srvConfig.Title != "" {
+		isupport["NETWORK"] = newString(srvConfig.Title)
+	}
+	if dc.network == nil && srvConfig.IconURL != "" {
+		isupport["draft/ICON"] = newString(srvConfig.IconURL)
+	} else if dc.network == nil && srvConfig.IconPath != "" {
+		isupport["draft/ICON"] = newString(srvConfig.HTTPIngress + "/icon")
+	}
+	if dc.user != nil {
+		if dc.network == nil {
+			isupport["BOT"] = newString("B")
+			isupport["CASEMAPPING"] = newString("ascii")
+			isupport["WHOX"] = nil
+			isupport["CHANTYPES"] = newString("")   // channels are not supported
+			isupport["LINELEN"] = newString("4096") // default bufio.Reader size
+		}
+		if _, ok := dc.user.msgStore.(msgstore.ChatHistoryStore); ok && dc.network != nil {
+			isupport["CHATHISTORY"] = newString(fmt.Sprintf("%v", chatHistoryLimit))
+			isupport["MSGREFTYPES"] = newString("timestamp")
+		}
+		if dc.caps.IsEnabled("soju.im/webpush") {
+			isupport["VAPID"] = newString(dc.srv.webPush.VAPIDKeys.Public)
+		}
+		if srvConfig.FileUploader != nil {
+			isupport["soju.im/FILEHOST"] = newString(srvConfig.HTTPIngress + "/uploads")
+		}
+	}
+
+	if uc := dc.upstream(); uc != nil {
+		// If upstream doesn't support message-tags, indicate that we'll drop
+		// all of them
+		if _, ok := uc.isupport["CLIENTTAGDENY"]; !ok && !uc.caps.IsEnabled("message-tags") {
+			isupport["CLIENTTAGDENY"] = newString("*")
+		}
+
+		for k := range passthroughIsupport {
+			v, ok := uc.isupport[k]
+			if !ok {
+				continue
+			}
+			isupport[k] = v
+		}
+	}
+
+	return isupport
+}
+
+func (dc *downstreamConn) updateIsupport(ctx context.Context) {
+	if !dc.registered && !dc.caps.IsEnabled("draft/extended-isupport") {
+		return
+	}
+
+	isupport := dc.buildIsupport()
+
+	changed := make(map[string]*string)
+	for k, v := range isupport {
+		if current, ok := dc.isupport[k]; ok {
+			if v == nil && current == nil {
+				continue
+			}
+			if v != nil && current != nil && *v == *current {
+				continue
+			}
+		}
+		changed[k] = v
+	}
+	for k := range dc.isupport {
+		if _, ok := isupport[k]; ok {
+			continue
+		}
+		changed["-"+k] = nil
+	}
+
+	sendIsupport(ctx, dc, changed)
+
+	dc.isupport = isupport
+}
+
 func (dc *downstreamConn) updateNick(ctx context.Context) {
 	var nick string
 	if uc := dc.upstream(); uc != nil {
@@ -1622,57 +1731,6 @@ func (dc *downstreamConn) welcome(ctx context.Context, user *user) error {
 
 	srvConfig := dc.srv.Config()
 
-	var isupport []string
-	isupport = append(isupport, permanentIsupport...)
-	if dc.network != nil {
-		isupport = append(isupport, fmt.Sprintf("BOUNCER_NETID=%v", dc.network.ID))
-	} else {
-		isupport = append(isupport, "BOT=B", "CASEMAPPING=ascii")
-	}
-	if dc.network == nil && srvConfig.Title != "" {
-		isupport = append(isupport, "NETWORK="+srvConfig.Title)
-	}
-	if dc.network == nil && srvConfig.IconURL != "" {
-		isupport = append(isupport, "draft/ICON="+srvConfig.IconURL)
-	} else if dc.network == nil && srvConfig.IconPath != "" {
-		isupport = append(isupport, "draft/ICON="+srvConfig.HTTPIngress+"/icon")
-	}
-	if dc.network == nil {
-		isupport = append(isupport, "WHOX")
-		isupport = append(isupport, "CHANTYPES=")   // channels are not supported
-		isupport = append(isupport, "LINELEN=4096") // default bufio.Reader size
-	}
-	if _, ok := dc.user.msgStore.(msgstore.ChatHistoryStore); ok && dc.network != nil {
-		isupport = append(isupport, fmt.Sprintf("CHATHISTORY=%v", chatHistoryLimit))
-		isupport = append(isupport, "MSGREFTYPES=timestamp")
-	}
-	if dc.caps.IsEnabled("soju.im/webpush") {
-		isupport = append(isupport, "VAPID="+dc.srv.webPush.VAPIDKeys.Public)
-	}
-	if srvConfig.FileUploader != nil {
-		isupport = append(isupport, "soju.im/FILEHOST="+srvConfig.HTTPIngress+"/uploads")
-	}
-
-	if uc := dc.upstream(); uc != nil {
-		// If upstream doesn't support message-tags, indicate that we'll drop
-		// all of them
-		if _, ok := uc.isupport["CLIENTTAGDENY"]; !ok && !uc.caps.IsEnabled("message-tags") {
-			isupport = append(isupport, "CLIENTTAGDENY=*")
-		}
-
-		for k := range passthroughIsupport {
-			v, ok := uc.isupport[k]
-			if !ok {
-				continue
-			}
-			if v != nil {
-				isupport = append(isupport, fmt.Sprintf("%v=%v", k, *v))
-			} else {
-				isupport = append(isupport, k)
-			}
-		}
-	}
-
 	dc.SendMessage(ctx, &irc.Message{
 		Command: irc.RPL_WELCOME,
 		Params:  []string{dc.nick, "Welcome to soju, " + dc.nick},
@@ -1685,9 +1743,7 @@ func (dc *downstreamConn) welcome(ctx context.Context, user *user) error {
 		Command: irc.RPL_MYINFO,
 		Params:  []string{dc.nick, srvConfig.Hostname, "soju", "aiwroO", "OovaimnqpsrtklbeI"},
 	})
-	for _, msg := range xirc.GenerateIsupport(isupport) {
-		dc.SendMessage(ctx, msg)
-	}
+	dc.updateIsupport(ctx)
 	if uc := dc.upstream(); uc != nil {
 		dc.SendMessage(ctx, &irc.Message{
 			Command: irc.RPL_UMODEIS,
@@ -3381,6 +3437,10 @@ func (dc *downstreamConn) handleMessageRegistered(ctx context.Context, msg *irc.
 			return err
 		}
 
+		if !dc.srv.Config().ClientCertAuth {
+			return newUnknownCommandError(msg.Command)
+		}
+
 		switch strings.ToUpper(subcommand) {
 		case "LIST":
 			certs, err := dc.srv.db.ListDeviceCertificates(ctx, dc.user.ID)
@@ -4007,6 +4067,24 @@ func parseNickServCredentials(text, nick string) (username, password string, ok 
 		return "", "", false
 	}
 	return username, password, true
+}
+
+func sendIsupport(ctx context.Context, dc *downstreamConn, isupport map[string]*string) {
+	if dc.caps.IsEnabled("draft/extended-isupport") {
+		dc.SendBatch(ctx, "draft/isupport", nil, nil, func(batchRef string) {
+			for _, msg := range xirc.GenerateIsupport(isupport) {
+				if msg.Tags == nil {
+					msg.Tags = make(map[string]string)
+				}
+				msg.Tags["batch"] = batchRef
+				dc.SendMessage(ctx, msg)
+			}
+		})
+	} else {
+		for _, msg := range xirc.GenerateIsupport(isupport) {
+			dc.SendMessage(ctx, msg)
+		}
+	}
 }
 
 func forwardChannel(ctx context.Context, dc *downstreamConn, ch *upstreamChannel) {
